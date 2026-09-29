@@ -1,0 +1,914 @@
+/* 
+Код керування Arduino IDE для системи автоматичного поливу. Пристрій зібраний на базі Ардуїно Nano, змонтовано в Arduino Nano V3.0 Shield. Живиться від блоку 5В 1А. П'ять Capasitive Soil Moisture Sensor v1.2 (підключені до пінів А0-А3 та А6) виміряють вологість у 5ти секторах з рослинами. П'ять двоконтактних кнопок розміщуються у відповідних секторах та запобігають переливу води. підключені до D7-D11 одним контактом та до GND другим. До D2 під'єднане єдине електромеханічне реле з контактом типу Normal closed, максимальний струм комутації 10 А, яке вмикає єдину 12 вольтову помпу. Помпа живиться від 12в окремо. До D12 підключений єдиний Сервопривід SG90: мікропривід для керування положенням, діапазон кутів повороту 0-180 градусів, кількість пульсів для керування кутом повороту 50 Гц., який повертає помпу в напрямку водоприймача одного з 5ти секторів. До піна D3 паралельно підключені 5 двоконтактних кнопок, працюючих аналогічно до кнопок у відповідних секторах , та запобігають переливу води з водоприймачів. HTU21D підкючений до A4-A5 у відповідності до datasheet, вимірює рівень вологості та температуру повітря. Вивід інформації з датчиків та події виводяться на Serial Monitor програми Arduino IDE. 
+Алгоритм роботи:
+При досяганні датчиком вологості PIN_SOIL_s1 (подыбні датчики по аналогії) порогу triggerAUTO_s1 серво отримує команду повороту у відповідне положення servo_position1. Вмикнути реле PIN_RELAY_wp1 на заданий проміжок часу timer_WATERING_AUTO. Якщо PIN_OWERFLOW_w1 або ReceiverOverflowState  TRUE, PIN_RELAY_wp1 не вмикається, або вимикається, якщо був ввімкнений. 
+Вивід даних структуровано здійснюється в Serial Monitor.
+ */
+#include <Wire.h>
+#include <Servo.h> 
+#include "SparkFunHTU21D.h"
+
+HTU21D myHumidity;
+Servo myservo;
+const int servopin = 12; 
+byte  delay_sensread = 10;
+
+//подключим реле
+const int PIN_RELAY_wp1 = 2;
+
+//подключим концевики от перелива поддонов
+const int PIN_OWERFLOW_w1 = 11;
+const int PIN_OWERFLOW_w2 = 10;
+const int PIN_OWERFLOW_w3 = 9;
+const int PIN_OWERFLOW_w4 = 8;
+const int PIN_OWERFLOW_w5 = 7;
+
+//подключим датчики влажности почвы
+const int PIN_SOIL_s1 = A0;
+const int PIN_SOIL_s2 = A1;
+const int PIN_SOIL_s3 = A2;
+const int PIN_SOIL_s4 = A3;
+const int PIN_SOIL_s5 = A6;
+
+// переменные для хранения необработанных значений датчиков почвы
+int RAW_val_w1;
+int RAW_val_w2;
+int RAW_val_w3;
+int RAW_val_w4;
+int RAW_val_w5;
+
+// переменные для хранения обработанных значений датчиков почвы
+int mstLvl_s1;
+int mstLvl_s2;
+int mstLvl_s3;
+int mstLvl_s4;
+int mstLvl_s5;
+
+// переменные для хранения значений датчиков почвы, приведенных к 100%
+int Val_PERCENTAGE_s1 = 0;
+int sensor_value_CAL_MIN_s1 = 380;
+int sensor_value_CAL_MAX_s1 = 592;
+int sensor_value_CAL_MIN_selftest_s1 = sensor_value_CAL_MIN_s1 - 20;
+int sensor_value_CAL_MAX_selftest_s1 = sensor_value_CAL_MAX_s1 + 20;
+
+int Val_PERCENTAGE_s2 = 0;
+int sensor_value_CAL_MIN_s2 = 258;
+int sensor_value_CAL_MAX_s2 = 476;
+int sensor_value_CAL_MIN_selftest_s2 = sensor_value_CAL_MIN_s2 - 20;
+int sensor_value_CAL_MAX_selftest_s2 = sensor_value_CAL_MAX_s2 + 20;
+
+int Val_PERCENTAGE_s3 = 0;
+int sensor_value_CAL_MIN_s3 = 261;
+int sensor_value_CAL_MAX_s3 = 498;
+int sensor_value_CAL_MIN_selftest_s3 = sensor_value_CAL_MIN_s3 - 20;
+int sensor_value_CAL_MAX_selftest_s3 = sensor_value_CAL_MAX_s3 + 20;
+
+int Val_PERCENTAGE_s4 = 0;
+int sensor_value_CAL_MIN_s4 = 274;
+int sensor_value_CAL_MAX_s4 = 485;
+int sensor_value_CAL_MIN_selftest_s4 = sensor_value_CAL_MIN_s4 - 20;
+int sensor_value_CAL_MAX_selftest_s4 = sensor_value_CAL_MAX_s4 + 20;
+
+int Val_PERCENTAGE_s5 = 0;
+int sensor_value_CAL_MIN_s5 = 300;
+int sensor_value_CAL_MAX_s5 = 500;
+int sensor_value_CAL_MIN_selftest_s5 = sensor_value_CAL_MIN_s5 - 20;
+int sensor_value_CAL_MAX_selftest_s5 = sensor_value_CAL_MAX_s5 + 20;
+
+// переменная для хранения значения датчика общего перелива
+const int ReceiverOverflowPin = 3;
+// переменная для хранения состояния датчика общего перелива
+int ReceiverOverflowState = 0;
+// переменная для хранения состояния реле водяной помпы
+bool SERMON_PIN_RELAY_wp1_state;
+
+// переменные для хранения триггеров датчиков почвы и перелива поддонов
+boolean OverflowState_w1 = 0;
+boolean OverflowState_w2 = 0;
+boolean OverflowState_w3 = 0;
+boolean OverflowState_w4 = 0;
+boolean OverflowState_w5 = 0;
+
+byte triggerAUTO_s1 = 0;
+byte triggerAUTO_s2 = 0;
+byte triggerAUTO_s3 = 0;
+byte triggerAUTO_s4 = 0;
+byte triggerAUTO_s5 = 0;
+
+
+#define timermillis_WATERING_MANUAL 100
+#define timermillis_timer_sensread 500
+unsigned long timer_WATERING_MANUAL = 60000;
+unsigned long timer_WATERING_AUTO = 10000;
+unsigned long timer_STANDBY = 60000;
+unsigned long previousMillis_HTU21D = 0;
+const unsigned long interval_HTU21D = 1000;
+const int delay_servo_position_BF = 1000;
+const int delay_servo_position_AF = 3000;
+unsigned long delay_overflow = 300000;
+unsigned long delay_SERVICE = 1800000;
+byte servo_position1 = 25;
+byte servo_position2 = 60;
+byte servo_position3 = 95;
+byte servo_position4 = 135;
+byte servo_position5 = 180;
+int VCC_S1;
+float voltage_S1;
+int VCC_S2;
+float voltage_S2;
+int VCC_S3;
+float voltage_S3;
+int VCC_S4;
+float voltage_S4;
+int VCC_S5;
+float voltage_S5;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(PIN_OWERFLOW_w1, INPUT_PULLUP);
+  pinMode(PIN_OWERFLOW_w2, INPUT_PULLUP);
+  pinMode(PIN_OWERFLOW_w3, INPUT_PULLUP);
+  pinMode(PIN_OWERFLOW_w4, INPUT_PULLUP);
+  pinMode(PIN_OWERFLOW_w5, INPUT_PULLUP);
+  pinMode(PIN_RELAY_wp1, OUTPUT);  
+  pinMode(ReceiverOverflowPin, INPUT); 
+  myservo.attach(servopin);
+
+  Serial.println();
+  Serial.print(F("\n¯|_(ツ)_/¯---SYSTEM STARTED---¯|_(ツ)_/¯..."));
+  Serial.print(F("\nSWS4009 w3 m5 mod.h..."));
+  Serial.println();
+  Serial.println(F("\nFor_MANUAL_WATERING_use_commands: \n1/off1 - Sector 1 Watering, \n2/off2 - Sector 2 Watering, \n3/off3 - Sector 3 Watering, \n4/off4 - Sector 4 Watering, \n5/off5 - Sector 5 Watering, \n0 - for STOP, \ns - for service pause, \na - For AUTO Mode"));
+  
+  Serial.print(F("\nReading HTU21D..."));
+  myHumidity.begin();
+  SERMON_HUM_TEMP();
+  SERMON_SERVO();
+  SERMON_RUNTIME();
+  
+  Serial.print(F("\nReading SOIL SENSORS..."));
+  MEASUREMOISTURE();
+  VCC();
+  CALIBRATION();
+  selfTest();
+  SERMON_RAW();
+}
+
+void loop() {
+  WATERING_MANUAL();
+}
+
+//функция приведения значений с датчиков почвы к процентному виду
+void CALIBRATION(){
+  Val_PERCENTAGE_s1 = mstLvl_s1;
+  if (Val_PERCENTAGE_s1 > sensor_value_CAL_MAX_s1) Val_PERCENTAGE_s1 = sensor_value_CAL_MAX_s1;
+  if (Val_PERCENTAGE_s1 < sensor_value_CAL_MIN_s1) Val_PERCENTAGE_s1 = sensor_value_CAL_MIN_s1;
+  Val_PERCENTAGE_s1 = constrain(Val_PERCENTAGE_s1, sensor_value_CAL_MIN_s1, sensor_value_CAL_MAX_s1);
+  Val_PERCENTAGE_s1 = map(Val_PERCENTAGE_s1, sensor_value_CAL_MIN_s1, sensor_value_CAL_MAX_s1, 100, 0);
+
+  Val_PERCENTAGE_s2 = mstLvl_s2;
+  if (Val_PERCENTAGE_s2 > sensor_value_CAL_MAX_s2) Val_PERCENTAGE_s2 = sensor_value_CAL_MAX_s2;
+  if (Val_PERCENTAGE_s2 < sensor_value_CAL_MIN_s2) Val_PERCENTAGE_s2 = sensor_value_CAL_MIN_s2;
+  Val_PERCENTAGE_s2 = constrain(Val_PERCENTAGE_s2, sensor_value_CAL_MIN_s2, sensor_value_CAL_MAX_s2);
+  Val_PERCENTAGE_s2 = map(Val_PERCENTAGE_s2, sensor_value_CAL_MIN_s2, sensor_value_CAL_MAX_s2, 100, 0);
+
+  Val_PERCENTAGE_s3 = mstLvl_s3;
+  if (Val_PERCENTAGE_s3 > sensor_value_CAL_MAX_s3) Val_PERCENTAGE_s3 = sensor_value_CAL_MAX_s3;
+  if (Val_PERCENTAGE_s3 < sensor_value_CAL_MIN_s3) Val_PERCENTAGE_s3 = sensor_value_CAL_MIN_s3;
+  Val_PERCENTAGE_s3 = constrain(Val_PERCENTAGE_s3, sensor_value_CAL_MIN_s3, sensor_value_CAL_MAX_s3);
+  Val_PERCENTAGE_s3 = map(Val_PERCENTAGE_s3, sensor_value_CAL_MIN_s3, sensor_value_CAL_MAX_s3, 100, 0);
+
+  Val_PERCENTAGE_s4 = mstLvl_s4;
+  if (Val_PERCENTAGE_s4 > sensor_value_CAL_MAX_s4) Val_PERCENTAGE_s4 = sensor_value_CAL_MAX_s4;
+  if (Val_PERCENTAGE_s4 < sensor_value_CAL_MIN_s4) Val_PERCENTAGE_s4 = sensor_value_CAL_MIN_s4;
+  Val_PERCENTAGE_s4 = constrain(Val_PERCENTAGE_s4, sensor_value_CAL_MIN_s4, sensor_value_CAL_MAX_s4);
+  Val_PERCENTAGE_s4 = map(Val_PERCENTAGE_s4, sensor_value_CAL_MIN_s4, sensor_value_CAL_MAX_s4, 100, 0);
+
+  Val_PERCENTAGE_s5 = mstLvl_s5;
+  if (Val_PERCENTAGE_s5 > sensor_value_CAL_MAX_s5) Val_PERCENTAGE_s5 = sensor_value_CAL_MAX_s5;
+  if (Val_PERCENTAGE_s5 < sensor_value_CAL_MIN_s5) Val_PERCENTAGE_s5 = sensor_value_CAL_MIN_s5;
+  Val_PERCENTAGE_s5 = constrain(Val_PERCENTAGE_s5, sensor_value_CAL_MIN_s5, sensor_value_CAL_MAX_s5);
+  Val_PERCENTAGE_s5 = map(Val_PERCENTAGE_s5, sensor_value_CAL_MIN_s5, sensor_value_CAL_MAX_s5, 100, 0);
+
+  SERMON_PIN_RELAY_wp1_state = digitalRead(PIN_RELAY_wp1);
+  if (SERMON_PIN_RELAY_wp1_state == HIGH) {
+    Val_PERCENTAGE_s1 += 4;
+    Val_PERCENTAGE_s2 += 4;
+    Val_PERCENTAGE_s3 += 4;
+    Val_PERCENTAGE_s4 += 4;
+    Val_PERCENTAGE_s5 += 4;
+  }
+}
+
+//функция калибровки датчиков перелива горшков и влажности почвы
+void MEASUREMOISTURE(){
+  RAW_val_w1 = 0;
+  RAW_val_w2 = 0;
+  RAW_val_w3 = 0;
+  RAW_val_w4 = 0;
+  RAW_val_w5 = 0;
+
+  delay(delay_sensread);
+  
+  READ_OVERFLOWS();                    // ← нове
+  
+  // === Читання датчиків вологості ===
+  byte mstLvlNumreadings = 50;
+  
+  mstLvl_s1 = 0;
+  for (byte a = 0; a < mstLvlNumreadings; a++) {
+    delay(delay_sensread);
+    mstLvl_s1 += analogRead(PIN_SOIL_s1);
+  }
+  mstLvl_s1 /= 50;
+
+  mstLvl_s2 = 0;
+  for (byte b = 0; b < mstLvlNumreadings; b++) {
+    delay(delay_sensread);
+    mstLvl_s2 += analogRead(PIN_SOIL_s2);
+  }
+  mstLvl_s2 /= 50;
+
+  mstLvl_s3 = 0;
+  for (byte c = 0; c < mstLvlNumreadings; c++) {
+    delay(delay_sensread);
+    mstLvl_s3 += analogRead(PIN_SOIL_s3);
+  }
+  mstLvl_s3 /= 50;
+
+  mstLvl_s4 = 0;
+  for (byte d = 0; d < mstLvlNumreadings; d++) {
+    delay(delay_sensread);
+    mstLvl_s4 += analogRead(PIN_SOIL_s4);
+  }
+  mstLvl_s4 /= 50;
+
+  mstLvl_s5 = 0;
+  for (byte e = 0; e < mstLvlNumreadings; e++) {
+    delay(delay_sensread);
+    mstLvl_s5 += analogRead(PIN_SOIL_s5);
+  }
+  mstLvl_s5 /= 50;
+}
+
+void VCC() {
+  VCC_S1 = analogRead(PIN_SOIL_s1);
+  voltage_S1 = VCC_S1 * (5.0 / 1023.0);
+  VCC_S2 = analogRead(PIN_SOIL_s2);
+  voltage_S2 = VCC_S2 * (5.0 / 1023.0);
+  VCC_S3 = analogRead(PIN_SOIL_s3);
+  voltage_S3 = VCC_S3 * (5.0 / 1023.0);
+  VCC_S4 = analogRead(PIN_SOIL_s4);
+  voltage_S4 = VCC_S4 * (5.0 / 1023.0);
+  VCC_S5 = analogRead(PIN_SOIL_s5);
+  voltage_S5 = VCC_S5 * (5.0 / 1023.0);
+}
+
+void SERMON_RAW(){
+  Serial.print(F("\nA0(S1):"));
+  Serial.print(mstLvl_s1);
+  Serial.print(F("\tA1(S2):"));
+  Serial.print(mstLvl_s2);
+  Serial.print(F("\tA2(S3):"));
+  Serial.print(mstLvl_s3);
+  Serial.print(F("\tA3(S4):"));
+  Serial.print(mstLvl_s4);
+  Serial.print(F("\tA6(S5):"));
+  Serial.print(mstLvl_s5);
+  Serial.print(F("\nV A0(S1):"));
+  Serial.print(voltage_S1);
+  Serial.print(F("\tV A1(S2):"));
+  Serial.print(voltage_S2);
+  Serial.print(F("\tV A2(S3):"));
+  Serial.print(voltage_S3);
+  Serial.print(F("\tV A3(S4):"));
+  Serial.print(voltage_S4);
+  Serial.print(F("\tV A6(S5):"));
+  Serial.print(voltage_S5);
+  Serial.print(F("\nD8(W1):"));
+  Serial.print(RAW_val_w1);
+  Serial.print(F("\tD9(W2):"));
+  Serial.print(RAW_val_w2);  
+  Serial.print(F("\tD10(W3):"));
+  Serial.print(RAW_val_w3);
+  Serial.print(F("\tD11(W4):"));
+  Serial.print(RAW_val_w4); 
+  Serial.print(F("\tD7(W5):"));
+  Serial.print(RAW_val_w5);
+  Serial.print(F("\n"));
+  Serial.print(sensor_value_CAL_MIN_s1);
+  Serial.print(F("-"));
+  Serial.print(sensor_value_CAL_MAX_s1);
+  Serial.print(F("\t\t"));
+  Serial.print(sensor_value_CAL_MIN_s2);
+  Serial.print(F("-"));
+  Serial.print(sensor_value_CAL_MAX_s2);
+  Serial.print(F("\t\t"));
+  Serial.print(sensor_value_CAL_MIN_s3);
+  Serial.print(F("-"));
+  Serial.print(sensor_value_CAL_MAX_s3);
+  Serial.print(F("\t\t"));
+  Serial.print(sensor_value_CAL_MIN_s4);
+  Serial.print(F("-"));
+  Serial.print(sensor_value_CAL_MAX_s4);
+  Serial.print(F("\t\t"));
+  Serial.print(sensor_value_CAL_MIN_s5);
+  Serial.print(F("-"));
+  Serial.print(sensor_value_CAL_MAX_s5);
+  Serial.print(F("\t\t"));
+}
+
+// допоміжні функції для поливу
+void servo_to_position(byte pos) {
+  digitalWrite(PIN_RELAY_wp1, LOW);
+  delay(delay_servo_position_BF);
+  myservo.write(pos);
+  delay(delay_servo_position_AF);
+}
+
+void start_watering() {
+  digitalWrite(PIN_RELAY_wp1, HIGH);
+  SERMON_pumpState();
+  MEASUREMOISTURE();
+  VCC();
+  CALIBRATION();
+}
+
+//функция ручного полива
+void WATERING_MANUAL(){
+  String readString;
+  String Q;
+  unsigned long currentMillis = millis();
+  static unsigned long previousMillis = 0;
+  
+  while (Serial.available()){
+    delay(1);
+    if(Serial.available()>0){
+      char c = Serial.read();
+      if (isControl(c)) break;
+      readString += c;
+    }
+  }
+  Q = readString;
+
+  if (Q=="help"){
+    Serial.print(F("\nFor_MANUAL_WATERING_use_commands: \n1 - Sector 1 Watering, \n2 - Sector 2 Watering, \n3 - Sector 3 Watering, \n4 - Sector 4 Watering, \n5 - Sector 5 Watering, \n0 - for STOP, \ns - for service pause, \na - For AUTO Mode"));
+    Serial.println();
+  }
+
+  if ((Q=="5") && (ReceiverOverflowState == LOW) && (OverflowState_w5 == HIGH)){
+    digitalWrite(PIN_RELAY_wp1, LOW);
+    delay(delay_servo_position_BF);
+    myservo.write(servo_position5);
+    delay(delay_servo_position_AF); 
+    digitalWrite(PIN_RELAY_wp1, HIGH);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN5"));
+    Serial.print(F("\nSECTOR_5_WATERING_START"));
+    SERMON_pumpState();
+    MEASUREMOISTURE();
+    VCC();
+    CALIBRATION();
+    SERMON5();
+    previousMillis = currentMillis;
+  }
+
+  if (Q=="off5"){
+    digitalWrite(PIN_RELAY_wp1,LOW);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN5"));
+    Serial.print(F("\nSECTOR_5_WATERING_CANCELLED"));
+    SERMON_pumpState();
+  }
+
+  if ((Q=="4") && (ReceiverOverflowState == LOW) && (OverflowState_w4 == HIGH)){
+    digitalWrite(PIN_RELAY_wp1, LOW);
+    delay(delay_servo_position_BF);
+    myservo.write(servo_position4);
+    delay(delay_servo_position_AF); 
+    digitalWrite(PIN_RELAY_wp1, HIGH);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN4"));
+    Serial.print(F("\nSECTOR_4_WATERING_START"));
+    SERMON_pumpState();
+    MEASUREMOISTURE();
+    VCC();
+    CALIBRATION();
+    SERMON4();
+    previousMillis = currentMillis;
+  }
+
+  if (Q=="off4"){
+    digitalWrite(PIN_RELAY_wp1,LOW);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN4"));
+    Serial.print(F("\nSECTOR_4_WATERING_CANCELLED"));
+    SERMON_pumpState();
+  }
+
+  if ((Q=="3") && (ReceiverOverflowState == LOW) && (OverflowState_w3 == HIGH)){
+    digitalWrite(PIN_RELAY_wp1, LOW);
+    delay(delay_servo_position_BF);
+    myservo.write(servo_position3);
+    delay(delay_servo_position_AF);
+    digitalWrite(PIN_RELAY_wp1, HIGH);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN3"));
+    Serial.print(F("\nSECTOR_3_WATERING_START"));
+    SERMON_pumpState();
+    MEASUREMOISTURE();
+    VCC();
+    CALIBRATION();
+    SERMON3();
+    previousMillis = currentMillis;
+  }
+
+  if (Q=="off3"){
+    digitalWrite(PIN_RELAY_wp1,LOW);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN3"));
+    Serial.print(F("\nSECTOR_3_WATERING_CANCELLED")); 
+    SERMON_pumpState(); 
+  }
+
+  if ((Q=="2") && (ReceiverOverflowState == LOW) && (OverflowState_w2 == HIGH)){
+    digitalWrite(PIN_RELAY_wp1, LOW);
+    delay(delay_servo_position_BF);
+    myservo.write(servo_position2);
+    delay(delay_servo_position_AF);
+    digitalWrite(PIN_RELAY_wp1, HIGH);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN2"));
+    Serial.print(F("\nSECTOR_2_WATERING_START"));
+    SERMON_pumpState();
+    MEASUREMOISTURE();
+    VCC();
+    CALIBRATION();
+    SERMON2();
+    previousMillis = currentMillis;
+  }
+
+  if (Q=="off2"){
+    digitalWrite(PIN_RELAY_wp1,LOW);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN2")); 
+    Serial.print(F("\nSECTOR_2_WATERING_CANCELLED")); 
+    SERMON_pumpState(); 
+  }
+
+  if ((Q=="1") && (ReceiverOverflowState == LOW) && (OverflowState_w1 == HIGH)){
+    digitalWrite(PIN_RELAY_wp1, LOW);
+    delay(delay_servo_position_BF);  
+    myservo.write(servo_position1);
+    delay(delay_servo_position_AF); 
+    digitalWrite(PIN_RELAY_wp1, HIGH);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN1"));
+    Serial.print(F("\nSECTOR_1_WATERING_START"));
+    SERMON_pumpState();
+    MEASUREMOISTURE();
+    VCC();
+    CALIBRATION();
+    SERMON1();
+    previousMillis = currentMillis;
+  }
+
+  if (Q=="off1"){
+    digitalWrite(PIN_RELAY_wp1,LOW);
+    Serial.println();
+    Serial.print(F("\nSYSTEM_MODE_:_MAN1"));
+    Serial.print(F("\nSECTOR_1_WATERING_CANCELLED")); 
+    SERMON_pumpState(); 
+  }
+
+  if (Q=="s"){
+    digitalWrite(PIN_RELAY_wp1,LOW);
+    Serial.println();
+    Serial.print(F("\nPAUSED_FOR_SERVICE_ON:")); 
+    Serial.print(delay_SERVICE/1000/60); 
+    Serial.print(F("\tmin")); 
+    delay(delay_SERVICE);
+  }
+
+  if (Q=="a" || Q==""){
+    digitalWrite(PIN_RELAY_wp1,LOW);
+    MEASUREMOISTURE();
+    VCC();
+    CALIBRATION();
+    WATERING_AUTO();
+  }
+
+  if (Q=="0") {
+    digitalWrite(PIN_RELAY_wp1,LOW);
+    Serial.println();
+    Serial.print(F("\nPUMP_EMERGENCY_STOP"));
+    SERMON_pumpState(); 
+  }
+
+  if ((currentMillis - previousMillis >= timer_WATERING_MANUAL) && (previousMillis != 0)) {
+    digitalWrite(PIN_RELAY_wp1, HIGH);
+    previousMillis = 0;
+  }
+}
+
+//функция автоматического полива
+//функция автоматического полива
+void WATERING_AUTO() {
+  static unsigned long wateringStart = 0;
+
+  ReceiverOverflowState = digitalRead(ReceiverOverflowPin);
+  READ_OVERFLOWS();
+
+  // === КРИТИЧНИЙ ПЕРЕЛИВ — ЗАГАЛЬНИЙ ПРИЙМАЧ ===
+  if (ReceiverOverflowState == HIGH) {
+    digitalWrite(PIN_RELAY_wp1, LOW);
+    Serial.print(F("\n!!! RECEIVER_OVERFLOW - FULL STOP !!!"));
+    SERMON_pumpState();
+    SERMON_RAW();
+    return;
+  }
+
+  // === Повідомлення про перелив на конкретних піддонах ===
+  if (OverflowState_w1 == LOW) Serial.print(F("\n!!! TRAY_1_OVERFLOW !!!"));
+  if (OverflowState_w2 == LOW) Serial.print(F("\n!!! TRAY_2_OVERFLOW !!!"));
+  if (OverflowState_w3 == LOW) Serial.print(F("\n!!! TRAY_3_OVERFLOW !!!"));
+  if (OverflowState_w4 == LOW) Serial.print(F("\n!!! TRAY_4_OVERFLOW !!!"));
+  if (OverflowState_w5 == LOW) Serial.print(F("\n!!! TRAY_5_OVERFLOW !!!"));
+
+  // === Основна логіка автополиву (полив тільки сухих піддонів) ===
+  if (OverflowState_w1 == HIGH && Val_PERCENTAGE_s1 < triggerAUTO_s1) {
+    servo_to_position(servo_position1);
+    start_watering();
+    Serial.print(F("\nSYSTEM_MODE_:_AUTOMATIC1"));
+    SERMON1();
+    wateringStart = millis();
+  }
+  else if (OverflowState_w2 == HIGH && Val_PERCENTAGE_s2 < triggerAUTO_s2) {
+    servo_to_position(servo_position2);
+    start_watering();
+    Serial.print(F("\nSYSTEM_MODE_:_AUTOMATIC2"));
+    SERMON2();
+    wateringStart = millis();
+  }
+  else if (OverflowState_w3 == HIGH && Val_PERCENTAGE_s3 < triggerAUTO_s3) {
+    servo_to_position(servo_position3);
+    start_watering();
+    Serial.print(F("\nSYSTEM_MODE_:_AUTOMATIC3"));
+    SERMON3();
+    wateringStart = millis();
+  }
+  else if (OverflowState_w4 == HIGH && Val_PERCENTAGE_s4 < triggerAUTO_s4) {
+    servo_to_position(servo_position4);
+    start_watering();
+    Serial.print(F("\nSYSTEM_MODE_:_AUTOMATIC4"));
+    SERMON4();
+    wateringStart = millis();
+  }
+  else if (OverflowState_w5 == HIGH && Val_PERCENTAGE_s5 < triggerAUTO_s5) {
+    servo_to_position(servo_position5);
+    start_watering();
+    Serial.print(F("\nSYSTEM_MODE_:_AUTOMATIC5"));
+    SERMON5();
+    wateringStart = millis();
+  }
+  else if((Val_PERCENTAGE_s1 >= triggerAUTO_s1) && (Val_PERCENTAGE_s2 >= triggerAUTO_s2) &&
+          (Val_PERCENTAGE_s3 >= triggerAUTO_s3) && (Val_PERCENTAGE_s4 >= triggerAUTO_s4) &&
+          (Val_PERCENTAGE_s5 >= triggerAUTO_s5)) {
+    
+    digitalWrite(PIN_RELAY_wp1, LOW);
+    Serial.print(F("\nSYSTEM_MODE_:_AUTOMATIC STBY"));
+    SERMON_STANDBY();
+  }
+
+  // Таймер вимкнення поливу
+  if ((wateringStart != 0) && (millis() - wateringStart >= timer_WATERING_AUTO)) {
+    digitalWrite(PIN_RELAY_wp1, LOW);
+    wateringStart = 0;
+  }
+}
+
+// ==================== НОВА ФУНКЦІЯ ====================
+void READ_OVERFLOWS() {
+  OverflowState_w1 = digitalRead(PIN_OWERFLOW_w1);
+  OverflowState_w2 = digitalRead(PIN_OWERFLOW_w2);
+  OverflowState_w3 = digitalRead(PIN_OWERFLOW_w3);
+  OverflowState_w4 = digitalRead(PIN_OWERFLOW_w4);
+  OverflowState_w5 = digitalRead(PIN_OWERFLOW_w5);
+  
+  RAW_val_w1 = OverflowState_w1;
+  RAW_val_w2 = OverflowState_w2;
+  RAW_val_w3 = OverflowState_w3;
+  RAW_val_w4 = OverflowState_w4;
+  RAW_val_w5 = OverflowState_w5;
+}
+
+void SERMON_pumpState(){
+  SERMON_PIN_RELAY_wp1_state = digitalRead(PIN_RELAY_wp1); 
+  if (SERMON_PIN_RELAY_wp1_state == LOW) {
+    Serial.print(F("\t(PUMP_STANDBY)"));
+  } else {
+    Serial.print(F("\t(PUMP_ACTIVE)"));
+  }
+}
+
+// Вивід статусу переливу піддонів
+void SERMON_OVERFLOWS() {
+  Serial.print(F("\nWATER_1:~~~"));
+  Serial.print(OverflowState_w1 == LOW ? "Y" : "N");
+  
+  Serial.print(F("\t\tWATER_2:~~~"));
+  Serial.print(OverflowState_w2 == LOW ? "Y" : "N");
+  
+  Serial.print(F("\t\t\t\tWATER_3:~~~"));
+  Serial.print(OverflowState_w3 == LOW ? "Y" : "N");
+  
+  Serial.print(F("\t\t\t\t\t\tWATER_4:~~~"));
+  Serial.print(OverflowState_w4 == LOW ? "Y" : "N");
+  
+  Serial.print(F("\t\t\t\t\t\t\t\tWATER_5:~~~"));
+  Serial.print(OverflowState_w5 == LOW ? "Y" : "N");
+}
+
+void selfTest(){
+  if((mstLvl_s1>sensor_value_CAL_MAX_selftest_s1)or(mstLvl_s1<sensor_value_CAL_MIN_selftest_s1)){
+    Serial.print(F("\nCHK_SOIL_S1!!!"));
+  } else {
+    Serial.print(F("\nSOIL_S1_OK"));
+  }
+  if((mstLvl_s2>sensor_value_CAL_MAX_selftest_s2)or(mstLvl_s2<sensor_value_CAL_MIN_selftest_s2)){
+    Serial.print(F("\tCHK_SOIL_S2!!!"));
+  } else {
+    Serial.print(F("\tSOIL_S2_OK"));
+  }
+  if((mstLvl_s3>sensor_value_CAL_MAX_selftest_s3)or(mstLvl_s3<sensor_value_CAL_MIN_selftest_s3)){
+    Serial.print(F("\tCHK_SOIL_S3!!!"));
+  } else {
+    Serial.print(F("\tSOIL_S3_OK"));
+  }
+  if((mstLvl_s4>sensor_value_CAL_MAX_selftest_s4)or(mstLvl_s4<sensor_value_CAL_MIN_selftest_s4)){
+    Serial.print(F("\tCHK_SOIL_S4!!!"));
+  } else {
+    Serial.print(F("\tSOIL_S4_OK"));
+  }
+  if((mstLvl_s5>sensor_value_CAL_MAX_selftest_s5)or(mstLvl_s5<sensor_value_CAL_MIN_selftest_s5)){
+    Serial.print(F("\tCHK_SOIL_S5!!!"));
+  } else {
+    Serial.print(F("\tSOIL_S5_OK"));
+  }
+}
+
+void SERMON_HUM_TEMP(){
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis_HTU21D >= interval_HTU21D) {
+    previousMillis_HTU21D = currentMillis;
+    float humd = myHumidity.readHumidity();
+    float temp = myHumidity.readTemperature();
+    Serial.print(F("\nAIR_Temp:"));
+    Serial.print(temp, 1);
+    Serial.print(F("°C"));
+    Serial.print(F("\tAIR_Hum:"));
+    Serial.print(humd, 1);
+    Serial.print(F("%"));
+  }
+}
+
+void SERMON_RUNTIME(){
+  uint32_t sec = millis() / 1000ul;
+  int timeHours = (sec / 3600ul);
+  int timeMins = (sec % 3600ul) / 60ul;
+  int timeSecs = (sec % 3600ul) % 60ul;
+  Serial.print(F("\tRunTime:"));
+  Serial.print(timeHours);
+  Serial.print(F("h"));
+  Serial.print(timeMins);
+  Serial.print(F("m"));
+  Serial.print(timeSecs);
+  Serial.print(F("s"));
+}
+
+void SERMON_SERVO(){
+  Serial.print(F("\tSERVO_is_Positioned_at:"));
+  Serial.print(myservo.read());
+  Serial.print(F("°")); 
+}
+
+void SERMON5(){
+    if((mstLvl_s5>sensor_value_CAL_MAX_selftest_s5)||(mstLvl_s5<sensor_value_CAL_MIN_selftest_s5)){
+    Serial.print(F("\n\t\t\t\t\t\t\t\t???????????"));
+    Serial.print(F("\n\t\t\t\t\t\t\t\tSOIL_5:***"));
+    Serial.print(F("CHK"));
+    }
+        else{
+        Serial.print(F("\n\t\t\t\t\t\t\t\t-^-^-^-^-^-"));
+        Serial.print(F("\n\t\t\t\t\t\t\t\tSOIL_5:***"));
+        Serial.print(Val_PERCENTAGE_s5);
+        Serial.print(F("%"));
+        }
+    Serial.print(F("\n\t\t\t\t\t\t\t\tWATER_5:~~~"));
+    if(OverflowState_w5==LOW){
+    Serial.print(F("Y"));
+    }
+        else{
+        Serial.print(F("N"));
+        }
+    SERMON_RAW();
+    Serial.print(F("\n\t\t\t\t\t\t\t\tTarget_5:"));
+    Serial.print(triggerAUTO_s5);
+    Serial.print(F("%"));
+    SERMON_HUM_TEMP();
+    SERMON_SERVO();
+    SERMON_RUNTIME();
+}
+
+void SERMON4(){
+    if((mstLvl_s4>sensor_value_CAL_MAX_selftest_s4)||(mstLvl_s4<sensor_value_CAL_MIN_selftest_s4)){
+        Serial.print(F("\n\t\t\t\t\t\t???????????"));
+        Serial.print(F("\n\t\t\t\t\t\tSOIL_4:***"));
+        Serial.print(F("CHK"));
+    }
+    else{
+        Serial.print(F("\n\t\t\t\t\t\t-^-^-^-^-^-"));
+        Serial.print(F("\n\t\t\t\t\t\tSOIL_4:***"));
+        Serial.print(Val_PERCENTAGE_s4);
+        Serial.print(F("%"));
+    }
+    Serial.print(F("\n\t\t\t\t\t\tWATER_4:~~~"));
+    if(OverflowState_w4==LOW){
+    Serial.print(F("Y"));
+    }
+        else{
+        Serial.print(F("N"));
+        }
+    SERMON_RAW();
+    Serial.print(F("\n\t\t\t\t\t\tTarget_4:"));
+    Serial.print(triggerAUTO_s4);
+    Serial.print(F("%"));
+    SERMON_HUM_TEMP();
+    SERMON_SERVO();
+    SERMON_RUNTIME();
+}
+
+void SERMON3(){
+    if((mstLvl_s3>sensor_value_CAL_MAX_selftest_s3)||(mstLvl_s3<sensor_value_CAL_MIN_selftest_s3)){
+        Serial.print(F("\n\t\t\t\t???????????"));
+        Serial.print(F("\n\t\t\t\tSOIL_3:***"));
+        Serial.print(F("CHK"));
+    }
+    else{
+        Serial.print(F("\n\t\t\t\t-^-^-^-^-^-"));
+        Serial.print(F("\n\t\t\t\tSOIL_3:***"));
+        Serial.print(Val_PERCENTAGE_s3);
+        Serial.print(F("%"));
+    }
+    Serial.print(F("\n\t\t\t\tWATER_3:~~~"));
+    if(OverflowState_w3==LOW){
+    Serial.print(F("Y"));
+    }
+        else{
+        Serial.print(F("N"));
+        }
+    SERMON_RAW();
+    Serial.print(F("\n\t\t\t\tTarget_3:"));
+    Serial.print(triggerAUTO_s3);
+    Serial.print(F("%"));
+    SERMON_HUM_TEMP();
+    SERMON_SERVO();
+    SERMON_RUNTIME();
+}
+
+void SERMON2(){
+    if((mstLvl_s2>sensor_value_CAL_MAX_selftest_s2)||(mstLvl_s2<sensor_value_CAL_MIN_selftest_s2)){
+        Serial.print(F("\n\t\t???????????"));
+        Serial.print(F("\n\t\tSOIL_2:***"));
+        Serial.print(F("CHK"));
+    }
+        else{
+            Serial.print(F("\n\t\t-^-^-^-^-^-"));
+            Serial.print(F("\n\t\tSOIL_2:***"));
+            Serial.print(Val_PERCENTAGE_s2);
+            Serial.print(F("%"));
+        }
+    Serial.print(F("\n\t\tWATER_2:~~~"));
+    if(OverflowState_w2==LOW){
+        Serial.print(F("Y"));
+    }
+    else{
+        Serial.print(F("N"));
+        }
+    SERMON_RAW();
+    Serial.print(F("\n\t\tTarget_2:"));
+    Serial.print(triggerAUTO_s2);
+    Serial.print(F("%"));
+    SERMON_HUM_TEMP();
+    SERMON_SERVO();
+    SERMON_RUNTIME();
+}
+
+void SERMON1(){
+    if((mstLvl_s1>sensor_value_CAL_MAX_selftest_s1)||(mstLvl_s1<sensor_value_CAL_MIN_selftest_s1)){
+        Serial.print(F("\n???????????"));
+        Serial.print(F("\nSOIL_1:***"));
+        Serial.print(F("CHK"));
+    }
+    else{
+        Serial.print(F("\n-^-^-^-^-^-"));
+        Serial.print(F("\nSOIL_1:***"));
+        Serial.print(Val_PERCENTAGE_s1);
+        Serial.print(F("%"));
+        }
+    Serial.print(F("\nWATER_1:~~~"));
+    if(OverflowState_w1==LOW){
+        Serial.print(F("Y"));
+    }
+    else{
+        Serial.print(F("N"));
+    }
+    SERMON_RAW();
+    Serial.print(F("\nTarget_1:"));
+    Serial.print(triggerAUTO_s1);
+    Serial.print(F("%"));
+    SERMON_HUM_TEMP();
+    SERMON_SERVO();
+    SERMON_RUNTIME();
+}
+
+void SERMON_STANDBY(){
+        Serial.print(F("\n----------\t----------\t----------\t----------\t----------"));
+
+        Serial.print(F("\nSOIL_1:***"));
+    if((mstLvl_s1>sensor_value_CAL_MAX_selftest_s1)or(mstLvl_s1<sensor_value_CAL_MIN_selftest_s1)){
+        Serial.print(F("CHK"));
+    }
+    else{
+        Serial.print(Val_PERCENTAGE_s1);
+        Serial.print(F("%"));
+    }
+
+    Serial.print(F("\tSOIL_2:***"));
+    if((mstLvl_s2>sensor_value_CAL_MAX_selftest_s2)or(mstLvl_s2<sensor_value_CAL_MIN_selftest_s2)){
+        Serial.print(F("CHK"));
+    }
+    else{
+        Serial.print(Val_PERCENTAGE_s2);
+        Serial.print(F("%"));
+    }
+
+    Serial.print(F("\tSOIL_3:***"));
+    if((mstLvl_s3>sensor_value_CAL_MAX_selftest_s3)or(mstLvl_s3<sensor_value_CAL_MIN_selftest_s3)){
+        Serial.print(F("CHK"));
+    }
+    else{
+        Serial.print(Val_PERCENTAGE_s3);
+        Serial.print(F("%"));
+    }
+
+    Serial.print(F("\tSOIL_4:***"));
+    if((mstLvl_s4>sensor_value_CAL_MAX_selftest_s4)or(mstLvl_s4<sensor_value_CAL_MIN_selftest_s4)){
+        Serial.print(F("CHK"));
+    }
+    else{
+        Serial.print(Val_PERCENTAGE_s4);
+        Serial.print(F("%"));
+    }
+
+        Serial.print(F("\tSOIL_5:***"));
+    if((mstLvl_s5>sensor_value_CAL_MAX_selftest_s5)or(mstLvl_s5<sensor_value_CAL_MIN_selftest_s5)){
+        Serial.print(F("CHK"));
+    }
+        
+    else{
+        Serial.print(Val_PERCENTAGE_s5);
+        Serial.print(F("%"));
+        }
+        
+    Serial.print(F("\nWATER_1:~~~"));
+    if(OverflowState_w1==LOW) Serial.print(F("Y")); else Serial.print(F("N"));
+    Serial.print(F("\tWATER_2:~~~"));
+    if(OverflowState_w2==LOW) Serial.print(F("Y")); else Serial.print(F("N"));
+    Serial.print(F("\tWATER_3:~~~"));
+    if(OverflowState_w3==LOW) Serial.print(F("Y")); else Serial.print(F("N"));
+    Serial.print(F("\tWATER_4:~~~"));
+    if(OverflowState_w4==LOW) Serial.print(F("Y")); else Serial.print(F("N"));
+    Serial.print(F("\tWATER_5:~~~"));
+    if(OverflowState_w5==LOW) Serial.print(F("Y")); else Serial.print(F("N"));
+
+    SERMON_RAW();
+    Serial.print(F("\nTarget_1:"));
+    Serial.print(triggerAUTO_s1);
+    Serial.print(F("%"));
+    Serial.print(F("\tTarget_2:"));
+    Serial.print(triggerAUTO_s2);
+    Serial.print(F("%"));
+    Serial.print(F("\tTarget_3:"));
+    Serial.print(triggerAUTO_s3);
+    Serial.print(F("%"));
+    Serial.print(F("\tTarget_4:"));
+    Serial.print(triggerAUTO_s4);
+    Serial.print(F("%"));
+    Serial.print(F("\tTarget_5:"));
+    Serial.print(triggerAUTO_s5);
+    Serial.print(F("%"));
+    SERMON_HUM_TEMP();
+    SERMON_SERVO();
+    SERMON_RUNTIME();
+}
