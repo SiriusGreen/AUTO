@@ -1,0 +1,1157 @@
+/*
+SWS 5009 state machine — система автоматического полива на Arduino Nano (V3.0 Shield, питание 5 В 1 А).
+
+Железо:
+  - 5 ёмкостных датчиков почвы v1.2: A0, A1, A2, A3, A6 (сектора 1..5).
+  - 5 концевиков переливов поддонов: D11, D10, D9, D8, D7 (сектора 1..5), второй контакт на GND.
+  - Концевик общего перелива приёмника: D3, вторым контактом на GND. ЗАМКНУТ НА GND = ПЕРЕЛИВ (как у поддонов).
+  - Помпа 12 В через MOSFET-плату на D4184: D2, управление ВЫСОКИМ уровнем (HIGH = помпа включена).
+    Плата коммутирует минус нагрузки: нужна общая земля с Nano, подтяжка затвора к GND (10 кОм)
+    и обратный диод параллельно помпе. Замените PUMP_ON/PUMP_OFF ниже, если плата инвертирует.
+  - Сервопривод SG90 на D12 поворачивает ВЫХОДНУЮ ТРУБКУ помпы к сектору.
+  - HTU21D на A4/A5 (I2C). Пассивный буззер на D13 (мелодии через библиотеку ezBuzzer).
+  - Вывод и управление через Serial Monitor, 9600 бод.
+
+Что нового относительно 5008:
+  - Полив управляется конечным автоматом (IDLE -> PRE -> MOVE -> WATER). Нет блокирующих delay():
+    защиты, команды и таймеры обрабатываются на каждом проходе loop().
+  - Защита от перелива работает всегда: общий концевик D3 останавливает помпу в любом режиме,
+    концевик поддона останавливает полив своего сектора, есть жёсткий предел времени работы помпы.
+  - Датчики почвы перемеряются в фоне (в ожидании каждые 10 с, при поливе каждые 10 с).
+  - Сектор с датчиком в состоянии CHK автополивом пропускается. После полива сектор "отдыхает" 5 минут.
+  - Настройки (калибровки, пороги, л/мин, объём бака, длительность автополива, звук) хранятся в EEPROM.
+    Счётчики воды хранятся в EEPROM кольцевым буфером (износ распределён).
+  - Команды Serial: см. help. Формат табличного вывода в Serial Monitor сохранён.
+  - Плюс команда status: одна машиночитаемая строка JSON (начинается с @) для будущего фронтенда.
+
+Вывод данных структурирован табуляцией, которая не может быть нарушена без согласования с разработчиком.
+*/
+#include <Wire.h>
+#include <Servo.h>
+#include <EEPROM.h>
+#include <ezBuzzer.h>
+#include <avr/pgmspace.h>
+#include "SparkFunHTU21D.h"
+
+// ============================================================================
+//  ПИНЫ И ПОЛЯРНОСТЬ
+// ============================================================================
+#define PUMP_ON   HIGH      // MOSFET D4184: HIGH = помпа включена
+#define PUMP_OFF  LOW       // LOW = выключена (и состояние при сбросе, если есть подтяжка затвора к GND)
+
+const byte SECTORS = 5;
+
+const byte PIN_PUMP          = 2;
+const byte PIN_RECEIVER_OVF  = 3;                      // ReceiverOverflowPin
+const byte PIN_TRAY[SECTORS] = {11, 10, 9, 8, 7};      // PIN_OWERFLOW_w1..w5
+const byte PIN_SOIL[SECTORS] = {A0, A1, A2, A3, A6};   // PIN_SOIL_s1..s5
+const byte PIN_SERVO         = 12;
+const byte PIN_BUZZER        = 13;
+
+const byte SERVO_POS[SECTORS] = {25, 60, 95, 135, 180};  // servo_position1..5
+
+// 1 = после полива отпускать сервопривод (нет гудения и помех на АЦП, пока полива нет).
+// Во время полива сервопривод всегда удерживает положение.
+#define SERVO_DETACH_IDLE 1
+
+// Поправка к проценту влажности, пока помпа ВКЛЮЧЕНА (в 5008 было +4 при выключенной помпе —
+// похоже на след инверсии полярности). 0 = выключено. Подберите по измерениям, если нужно.
+const int PUMP_ON_COMP_PCT = 0;
+
+// ============================================================================
+//  ВРЕМЕНА
+// ============================================================================
+const unsigned long T_MANUAL_MS        = 60000UL;    // timer_WATERING_MANUAL
+const unsigned long T_STANDBY_MS       = 60000UL;    // период отчёта STBY и повтора аварий
+const unsigned long T_UPDATE_MS        = 10000UL;    // перемер при поливе (WATERING_UPDATE_INTERVAL)
+const unsigned long T_MEASURE_IDLE_MS  = 10000UL;    // перемер в ожидании
+const unsigned long T_SERVO_BEFORE_MS  = 1000UL;     // delay_servo_position_BF
+const unsigned long T_SERVO_AFTER_MS   = 3000UL;     // delay_servo_position_AF
+const unsigned long T_SOAK_MS          = 300000UL;   // пауза между поливами одного сектора
+const unsigned long T_SERVICE_MS       = 1800000UL;  // delay_SERVICE
+const unsigned long T_PUMP_HARD_MAX_MS = 120000UL;   // абсолютный предел непрерывной работы помпы
+const unsigned long T_OVF_RELEASE_MS   = 1500UL;     // сколько концевик должен быть разомкнут, чтобы снять перелив
+const unsigned long T_HTU21D_MS        = 60000UL;    // interval_HTU21D
+
+const byte MEASURE_SAMPLES   = 25;
+const byte SENSOR_SAMPLE_MS  = 10;                   // delay_sensread
+const int  SELFTEST_MARGIN   = 20;
+const unsigned int AUTO_SEC_MAX = 100;               // должно быть меньше T_PUMP_HARD_MAX_MS
+
+// ============================================================================
+//  EEPROM
+// ============================================================================
+const int  EE_CFG_ADDR  = 0;
+const int  EE_CNT_ADDR  = 64;
+const byte CNT_SLOTS    = 8;
+const byte CFG_VERSION  = 1;
+
+struct Settings {
+  byte     magic0, magic1, ver;
+  int16_t  calMin[SECTORS];     // показание в воде (100 %)
+  int16_t  calMax[SECTORS];     // показание в воздухе (0 %)
+  byte     trig[SECTORS];       // порог автополива, % (0 = автополив сектора выключен)
+  float    flowLpm;             // производительность помпы, л/мин (0 = не задана)
+  float    tankL;               // объём бака, л (0 = не задан)
+  uint16_t autoSec;             // длительность автополива, с
+  byte     sound;               // 1 = мелодии включены
+  byte     crc;
+};
+
+struct Counters {
+  uint32_t seq;
+  float    vol[SECTORS];        // накачано по секторам, л
+  float    sinceRefill;         // накачано с последней заправки бака, л
+  byte     servoPos;            // последнее положение серво
+  byte     crc;
+};
+
+const int16_t DEF_CAL_MIN[SECTORS] PROGMEM = {380, 258, 261, 274, 300};
+const int16_t DEF_CAL_MAX[SECTORS] PROGMEM = {592, 610, 498, 485, 500};
+const byte    DEF_TRIG[SECTORS]    PROGMEM = {0, 0, 70, 0, 0};
+
+Settings cfg;
+Counters cnt;
+byte cntSlot = CNT_SLOTS - 1;
+
+// ============================================================================
+//  СОСТОЯНИЕ
+// ============================================================================
+HTU21D myHumidity;
+Servo  myservo;
+ezBuzzer buzzer(PIN_BUZZER, BUZZER_TYPE_PASSIVE);
+
+const byte ST_IDLE = 0, ST_PRE = 1, ST_MOVE = 2, ST_WATER = 3;
+byte st = ST_IDLE;
+byte curSec = 0;                 // 0..4
+bool curManual = false;
+unsigned long stSince = 0;
+
+bool serviceActive = false;
+unsigned long serviceSince = 0;
+
+// датчики
+int  mstLvl[SECTORS];            // mstLvl_s1..s5
+int  pct[SECTORS];               // Val_PERCENTAGE_s1..s5
+bool sensorOk[SECTORS];
+float voltage[SECTORS];          // voltage_S1..S5
+int  rawTray[SECTORS];           // RAW_val_w1..w5 (сырое чтение концевиков)
+
+bool measActive = false;
+byte measN = 0;
+long measSum[SECTORS];
+unsigned long measT = 0;
+unsigned long lastMeasure = 0;
+bool reportAfterMeasure = false;
+
+// переливы (с задержкой снятия)
+bool trayOv[SECTORS];
+bool trayNew[SECTORS];
+unsigned long trayLow[SECTORS];
+bool recvOv = false, recvNew = false;
+unsigned long recvLow = 0;
+unsigned long lastRecvMsg = 0, lastTrayMsg = 0;
+
+// помпа
+bool pumpIsOn = false;
+unsigned long pumpOnSince = 0;
+byte pumpSector = 0;
+unsigned long sessionMs = 0;
+float sessionL = 0.0f;
+
+// серво
+bool servoAttached = false;
+byte servoPosNow = 0;
+
+// автополив
+unsigned long lastEnd[SECTORS];
+bool everWatered[SECTORS];
+unsigned long lastStby = 0;
+unsigned long lastTankMsg = 0;
+
+// воздух
+float lastAirTemp = 0.0f;
+float lastAirHum  = 0.0f;
+bool  airOk = false;
+unsigned long previousMillis_HTU21D = 0;
+
+// команды
+char cmdBuf[24];
+byte cmdLen = 0;
+bool cmdOver = false;
+unsigned long lastRx = 0;
+
+// ============================================================================
+//  МЕЛОДИИ (ezBuzzer, пассивный буззер, без блокировок)
+// ============================================================================
+const byte MEL_MAX = 8;
+int melNotes[MEL_MAX];
+int melDur[MEL_MAX];
+byte melPrio = 0;
+
+const int M_START_N[]  PROGMEM = {NOTE_C5, NOTE_E5, NOTE_G5, NOTE_C6};
+const int M_START_D[]  PROGMEM = {8, 8, 8, 4};
+const int M_SECT_N[]   PROGMEM = {NOTE_C5, NOTE_D5, NOTE_E5, NOTE_G5, NOTE_A5};   // сектор n = первые n нот
+const int M_SECT_D[]   PROGMEM = {10, 10, 10, 10, 10};
+const int M_PUMP_N[]   PROGMEM = {NOTE_A5};
+const int M_PUMP_D[]   PROGMEM = {12};
+const int M_DONE_N[]   PROGMEM = {NOTE_G5, NOTE_E5, NOTE_C5};
+const int M_DONE_D[]   PROGMEM = {8, 8, 4};
+const int M_STOP_N[]   PROGMEM = {NOTE_A4, NOTE_A4};
+const int M_STOP_D[]   PROGMEM = {6, 6};
+const int M_TRAY_N[]   PROGMEM = {NOTE_A5, NOTE_E5, NOTE_A5, NOTE_E5};
+const int M_TRAY_D[]   PROGMEM = {8, 8, 8, 8};
+const int M_RECV_N[]   PROGMEM = {NOTE_C6, NOTE_E5, NOTE_C6, NOTE_E5, NOTE_C6, NOTE_E5, NOTE_C6, NOTE_E5};
+const int M_RECV_D[]   PROGMEM = {10, 10, 10, 10, 10, 10, 10, 10};
+const int M_TANK_N[]   PROGMEM = {NOTE_E5, NOTE_C5, NOTE_A4};
+const int M_TANK_D[]   PROGMEM = {4, 4, 2};
+
+void playMel(const int *n, const int *d, byte len, byte prio) {
+  if (!cfg.sound && prio < 3) return;                         // аварии звучат всегда
+  if (len > MEL_MAX) len = MEL_MAX;
+  if (buzzer.getState() == BUZZER_MELODY && melPrio > prio) return;
+  buzzer.stop();
+  memcpy_P(melNotes, n, len * sizeof(int));
+  memcpy_P(melDur, d, len * sizeof(int));
+  melPrio = prio;
+  buzzer.playMelody(melNotes, melDur, len);
+}
+
+void tuneStart()        { playMel(M_START_N, M_START_D, 4, 1); }
+void tuneSector(byte i) { playMel(M_SECT_N, M_SECT_D, i + 1, 1); }
+void tunePumpOn()       { playMel(M_PUMP_N, M_PUMP_D, 1, 1); }
+void tuneDone()         { playMel(M_DONE_N, M_DONE_D, 3, 1); }
+void tuneStop()         { playMel(M_STOP_N, M_STOP_D, 2, 2); }
+void tuneTray()         { playMel(M_TRAY_N, M_TRAY_D, 4, 3); }
+void tuneRecv()         { playMel(M_RECV_N, M_RECV_D, 8, 3); }
+void tuneTank()         { playMel(M_TANK_N, M_TANK_D, 3, 2); }
+
+// ============================================================================
+//  EEPROM
+// ============================================================================
+byte crc8(const byte *p, size_t n) {
+  byte c = 0;
+  while (n--) {
+    c ^= *p++;
+    for (byte k = 0; k < 8; k++) c = (c & 0x80) ? (byte)((c << 1) ^ 0x07) : (byte)(c << 1);
+  }
+  return c;
+}
+
+void settingsDefaults() {
+  cfg.magic0 = 'W'; cfg.magic1 = 'S'; cfg.ver = CFG_VERSION;
+  for (byte i = 0; i < SECTORS; i++) {
+    cfg.calMin[i] = pgm_read_word(&DEF_CAL_MIN[i]);
+    cfg.calMax[i] = pgm_read_word(&DEF_CAL_MAX[i]);
+    cfg.trig[i]   = pgm_read_byte(&DEF_TRIG[i]);
+  }
+  cfg.flowLpm = 0.0f;
+  cfg.tankL   = 0.0f;
+  cfg.autoSec = 10;
+  cfg.sound   = 1;
+}
+
+void settingsSanitize() {
+  for (byte i = 0; i < SECTORS; i++) if (cfg.trig[i] > 100) cfg.trig[i] = 0;
+  if (!(cfg.flowLpm >= 0.0f && cfg.flowLpm <= 500.0f)) cfg.flowLpm = 0.0f;
+  if (!(cfg.tankL >= 0.0f && cfg.tankL <= 10000.0f)) cfg.tankL = 0.0f;
+  if (cfg.autoSec < 1 || cfg.autoSec > AUTO_SEC_MAX) cfg.autoSec = 10;
+  if (cfg.sound > 1) cfg.sound = 1;
+}
+
+bool settingsLoad() {
+  Settings t;
+  EEPROM.get(EE_CFG_ADDR, t);
+  if (t.magic0 != 'W' || t.magic1 != 'S' || t.ver != CFG_VERSION) return false;
+  if (t.crc != crc8((const byte *)&t, sizeof(t) - 1)) return false;
+  cfg = t;
+  settingsSanitize();
+  return true;
+}
+
+void settingsSave() {
+  cfg.crc = crc8((const byte *)&cfg, sizeof(cfg) - 1);
+  EEPROM.put(EE_CFG_ADDR, cfg);       // put() пишет только изменившиеся байты
+}
+
+void countersDefaults() {
+  memset(&cnt, 0, sizeof(cnt));
+  cntSlot = CNT_SLOTS - 1;
+}
+
+bool countersLoad() {
+  bool found = false;
+  uint32_t best = 0;
+  for (byte s = 0; s < CNT_SLOTS; s++) {
+    Counters t;
+    EEPROM.get(EE_CNT_ADDR + (int)s * (int)sizeof(Counters), t);
+    if (t.seq == 0 || t.seq == 0xFFFFFFFFUL) continue;
+    if (t.crc != crc8((const byte *)&t, sizeof(t) - 1)) continue;
+    if (!found || t.seq > best) { best = t.seq; cnt = t; cntSlot = s; found = true; }
+  }
+  return found;
+}
+
+void countersSave() {
+  cnt.seq++;
+  cntSlot = (cntSlot + 1) % CNT_SLOTS;
+  cnt.crc = crc8((const byte *)&cnt, sizeof(cnt) - 1);
+  EEPROM.put(EE_CNT_ADDR + (int)cntSlot * (int)sizeof(Counters), cnt);
+}
+
+float tankLeft()  { return cfg.tankL - cnt.sinceRefill; }
+bool  tankEmpty() { return cfg.tankL > 0.0f && cnt.sinceRefill >= cfg.tankL; }
+bool  tankLow()   { return cfg.tankL > 0.0f && tankLeft() <= cfg.tankL * 0.1f; }
+
+// ============================================================================
+//  ПОМПА И СЕРВО
+// ============================================================================
+void pumpOn(byte sector) {
+  pumpSector = sector;
+  pumpOnSince = millis();
+  digitalWrite(PIN_PUMP, PUMP_ON);
+  pumpIsOn = true;
+}
+
+void pumpOff() {
+  digitalWrite(PIN_PUMP, PUMP_OFF);
+  if (pumpIsOn) {
+    pumpIsOn = false;
+    unsigned long dt = millis() - pumpOnSince;
+    float l = cfg.flowLpm * ((float)dt / 60000.0f);
+    sessionMs += dt;
+    sessionL  += l;
+    cnt.vol[pumpSector] += l;
+    cnt.sinceRefill     += l;
+  }
+}
+
+void servoMove(byte pos) {
+  myservo.write(pos);                 // сначала write, потом attach: серво не дёргается в 90°
+  if (!servoAttached) { myservo.attach(PIN_SERVO); servoAttached = true; }
+  servoPosNow = pos;
+  cnt.servoPos = pos;
+}
+
+void servoRelease() {
+#if SERVO_DETACH_IDLE
+  if (servoAttached) { myservo.detach(); servoAttached = false; }
+#endif
+}
+
+// ============================================================================
+//  ВХОДЫ, ПЕРЕЛИВЫ
+// ============================================================================
+void sampleInputs() {
+  unsigned long now = millis();
+  for (byte i = 0; i < SECTORS; i++) {
+    int r = digitalRead(PIN_TRAY[i]);
+    rawTray[i] = r;
+    if (r == LOW) {
+      trayLow[i] = now;
+      if (!trayOv[i]) { trayOv[i] = true; trayNew[i] = true; }
+    } else if (trayOv[i] && (now - trayLow[i] >= T_OVF_RELEASE_MS)) {
+      trayOv[i] = false;
+    }
+  }
+  int rr = digitalRead(PIN_RECEIVER_OVF);
+  if (rr == HIGH) {
+    recvLow = now;
+    if (!recvOv) { recvOv = true; recvNew = true; }
+  } else if (recvOv && (now - recvLow >= T_OVF_RELEASE_MS)) {
+    recvOv = false;
+  }
+  // аппаратная реакция сразу, без печати: перелив -> помпа выключена
+  if (pumpIsOn && (recvOv || trayOv[pumpSector])) pumpOff();
+}
+
+// ============================================================================
+//  ИЗМЕРЕНИЕ ПОЧВЫ
+// ============================================================================
+void measureStart() {
+  measActive = true;
+  measN = 0;
+  for (byte i = 0; i < SECTORS; i++) measSum[i] = 0;
+  measT = millis();
+}
+
+bool measureTick() {                     // true, когда измерение завершено
+  if (!measActive) return false;
+  if (millis() - measT < SENSOR_SAMPLE_MS) return false;
+  measT = millis();
+  for (byte i = 0; i < SECTORS; i++) measSum[i] += analogRead(PIN_SOIL[i]);
+  if (++measN >= MEASURE_SAMPLES) {
+    for (byte i = 0; i < SECTORS; i++) mstLvl[i] = (int)(measSum[i] / MEASURE_SAMPLES);
+    measActive = false;
+    return true;
+  }
+  return false;
+}
+
+void vccRead() {                          // VCC(): напряжение на выходе датчика
+  for (byte i = 0; i < SECTORS; i++) voltage[i] = analogRead(PIN_SOIL[i]) * (5.0f / 1023.0f);
+}
+
+void calibrate() {                        // CALIBRATION(): сырое значение -> проценты
+  for (byte i = 0; i < SECTORS; i++) {
+    int lo = cfg.calMin[i], hi = cfg.calMax[i];
+    bool rangeOk = (hi - lo) >= 30;
+    sensorOk[i] = rangeOk && (mstLvl[i] <= hi + SELFTEST_MARGIN) && (mstLvl[i] >= lo - SELFTEST_MARGIN);
+    if (rangeOk) {
+      int v = constrain(mstLvl[i], lo, hi);
+      int p = map(v, lo, hi, 100, 0);
+      if (pumpIsOn) p += PUMP_ON_COMP_PCT;
+      pct[i] = constrain(p, 0, 100);
+    } else {
+      pct[i] = 0;
+    }
+  }
+}
+
+void measureBlocking() {                  // только для setup и команд при выключенной помпе
+  measureStart();
+  while (!measureTick()) { buzzer.loop(); sampleInputs(); }
+  vccRead();
+  calibrate();
+  lastMeasure = millis();
+}
+
+// ============================================================================
+//  ВЫВОД В SERIAL MONITOR (формат и табуляция сохранены)
+// ============================================================================
+void nlIndent(byte i) {                   // "\n" + 2*i табуляций (сектор i = 0..4)
+  Serial.print(F("\n"));
+  for (byte k = 0; k < i * 2; k++) Serial.print(F("\t"));
+}
+
+void SERMON_pumpState() {
+  if (digitalRead(PIN_PUMP) == PUMP_ON) {
+    Serial.print(F("\t(PUMP_ACTIVE)"));
+    Serial.print(F("\n"));
+  } else {
+    Serial.print(F("\t(PUMP_STANDBY)"));
+  }
+}
+
+void htuRead() {
+  float h = myHumidity.readHumidity();
+  float t = myHumidity.readTemperature();
+  if (h < 990.0f && t < 990.0f) { lastAirHum = h; lastAirTemp = t; airOk = true; }   // 998/999 = ошибка датчика
+  else airOk = false;
+}
+
+void SERMON_HUM_TEMP() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis_HTU21D >= T_HTU21D_MS) {
+    previousMillis_HTU21D = currentMillis;
+    htuRead();
+  }
+  if (airOk) {
+    Serial.print(F("\nAIR_Temp:"));
+    Serial.print(lastAirTemp, 1);
+    Serial.print(F("°C"));
+    Serial.print(F("\tAIR_Hum:"));
+    Serial.print(lastAirHum, 1);
+    Serial.print(F("%"));
+  } else {
+    Serial.print(F("\nAIR_Temp:ERR\tAIR_Hum:ERR"));
+  }
+}
+
+void SERMON_RUNTIME() {
+  uint32_t sec = millis() / 1000ul;
+  int timeHours = (sec / 3600ul);
+  int timeMins = (sec % 3600ul) / 60ul;
+  int timeSecs = (sec % 3600ul) % 60ul;
+  Serial.print(F("\tRunTime:"));
+  Serial.print(timeHours);
+  Serial.print(F("h"));
+  Serial.print(timeMins);
+  Serial.print(F("m"));
+  Serial.print(timeSecs);
+  Serial.print(F("s"));
+  Serial.print(F("\n"));
+}
+
+void SERMON_SERVO() {
+  Serial.print(F("\tSERVO_is_Positioned_at:"));
+  Serial.print(servoPosNow);
+  Serial.print(F("°"));
+}
+
+void SERMON_RAW() {
+  Serial.print(F("\nA0(S1):"));
+  Serial.print(mstLvl[0]);
+  Serial.print(F("\tA1(S2):"));
+  Serial.print(mstLvl[1]);
+  Serial.print(F("\tA2(S3):"));
+  Serial.print(mstLvl[2]);
+  Serial.print(F("\tA3(S4):"));
+  Serial.print(mstLvl[3]);
+  Serial.print(F("\tA6(S5):"));
+  Serial.print(mstLvl[4]);
+  Serial.print(F("\nV A0(S1):"));
+  Serial.print(voltage[0]);
+  Serial.print(F("\tV A1(S2):"));
+  Serial.print(voltage[1]);
+  Serial.print(F("\tV A2(S3):"));
+  Serial.print(voltage[2]);
+  Serial.print(F("\tV A3(S4):"));
+  Serial.print(voltage[3]);
+  Serial.print(F("\tV A6(S5):"));
+  Serial.print(voltage[4]);
+  Serial.print(F("\nD8(W1):"));
+  Serial.print(rawTray[0]);
+  Serial.print(F("\tD9(W2):"));
+  Serial.print(rawTray[1]);
+  Serial.print(F("\tD10(W3):"));
+  Serial.print(rawTray[2]);
+  Serial.print(F("\tD11(W4):"));
+  Serial.print(rawTray[3]);
+  Serial.print(F("\tD7(W5):"));
+  Serial.print(rawTray[4]);
+  Serial.print(F("\n"));
+  for (byte i = 0; i < SECTORS; i++) {
+    Serial.print(cfg.calMin[i]);
+    Serial.print(F("-"));
+    Serial.print(cfg.calMax[i]);
+    Serial.print(F("\t\t"));
+  }
+}
+
+void selfTest() {
+  for (byte i = 0; i < SECTORS; i++) {
+    bool bad = (mstLvl[i] > cfg.calMax[i] + SELFTEST_MARGIN) || (mstLvl[i] < cfg.calMin[i] - SELFTEST_MARGIN);
+    Serial.print(i == 0 ? F("\n") : F("\t"));
+    if (bad) {
+      Serial.print(F("CHK_SOIL_S"));
+      Serial.print(i + 1);
+      Serial.print(F("!!!"));
+    } else {
+      Serial.print(F("SOIL_S"));
+      Serial.print(i + 1);
+      Serial.print(F("_OK"));
+    }
+  }
+}
+
+// SERMON1..SERMON5: сектор i = 0..4, отступ (i)*2 табуляций
+void SERMONn(byte i) {
+  nlIndent(i);
+  if (!sensorOk[i]) {
+    Serial.print(F("???????????"));
+    nlIndent(i);
+    Serial.print(F("SOIL_"));
+    Serial.print(i + 1);
+    Serial.print(F(":***"));
+    Serial.print(F("CHK"));
+  } else {
+    Serial.print(F("-^-^-^-^-^-"));
+    nlIndent(i);
+    Serial.print(F("SOIL_"));
+    Serial.print(i + 1);
+    Serial.print(F(":***"));
+    Serial.print(pct[i]);
+    Serial.print(F("%"));
+  }
+  nlIndent(i);
+  Serial.print(F("WATER_"));
+  Serial.print(i + 1);
+  Serial.print(F(":~~~"));
+  Serial.print(rawTray[i] == LOW ? F("Y") : F("N"));
+  SERMON_RAW();
+  nlIndent(i);
+  Serial.print(F("Target_"));
+  Serial.print(i + 1);
+  Serial.print(F(":"));
+  Serial.print(cfg.trig[i]);
+  Serial.print(F("%"));
+  SERMON_HUM_TEMP();
+  SERMON_SERVO();
+  SERMON_RUNTIME();
+}
+
+void SERMON_STANDBY() {
+  Serial.print(F("\n----------\t----------\t----------\t----------\t----------"));
+  for (byte i = 0; i < SECTORS; i++) {
+    Serial.print(i == 0 ? F("\nSOIL_") : F("\tSOIL_"));
+    Serial.print(i + 1);
+    Serial.print(F(":***"));
+    if (!sensorOk[i]) {
+      Serial.print(F("CHK"));
+    } else {
+      Serial.print(pct[i]);
+      Serial.print(F("%"));
+    }
+  }
+  for (byte i = 0; i < SECTORS; i++) {
+    Serial.print(i == 0 ? F("\nWATER_") : F("\tWATER_"));
+    Serial.print(i + 1);
+    Serial.print(F(":~~~"));
+    Serial.print(rawTray[i] == LOW ? F("Y") : F("N"));
+  }
+  SERMON_RAW();
+  for (byte i = 0; i < SECTORS; i++) {
+    Serial.print(i == 0 ? F("\nTarget_") : F("\tTarget_"));
+    Serial.print(i + 1);
+    Serial.print(F(":"));
+    Serial.print(cfg.trig[i]);
+    Serial.print(F("%"));
+  }
+  SERMON_HUM_TEMP();
+  SERMON_SERVO();
+  SERMON_RUNTIME();
+}
+
+// ============================================================================
+//  КОНЕЧНЫЙ АВТОМАТ ПОЛИВА
+// ============================================================================
+void endWatering(const __FlashStringHelper *why) {
+  bool active = (st != ST_IDLE);
+  pumpOff();
+  servoRelease();
+  if (!active) return;
+  byte s = curSec;
+  st = ST_IDLE;
+  lastEnd[s] = millis();
+  everWatered[s] = true;
+  Serial.print(F("\nWATERING_END sector "));
+  Serial.print(s + 1);
+  Serial.print(F(" ("));
+  Serial.print(why);
+  Serial.print(F(") "));
+  Serial.print(sessionMs / 1000.0f, 1);
+  Serial.print(F("s "));
+  Serial.print(sessionL, 2);
+  Serial.print(F("L"));
+  if (sessionMs > 0) countersSave();
+}
+
+void beginWatering(byte sec, bool manual) {
+  if (st != ST_IDLE) endWatering(F("SWITCH"));
+  pumpOff();
+  curSec = sec;
+  curManual = manual;
+  sessionMs = 0;
+  sessionL = 0.0f;
+  st = ST_PRE;
+  stSince = millis();
+}
+
+void enterWater() {
+  if (recvOv || trayOv[curSec]) { endWatering(F("OVERFLOW_BLOCK")); return; }
+  pumpOn(curSec);
+  st = ST_WATER;
+  stSince = millis();
+  lastMeasure = stSince;
+  tunePumpOn();
+  Serial.print(F("\n>>> START_WATERING sector "));
+  Serial.println(curSec + 1);
+  SERMON_pumpState();
+  Serial.println(F("<<< END start_watering"));
+  if (curManual) {
+    Serial.print(F("\nSYSTEM_MODE_:_MAN"));
+    Serial.print(curSec + 1);
+    Serial.print(F("\nSECTOR_"));
+    Serial.print(curSec + 1);
+    Serial.println(F("_WATERING_START"));
+  } else {
+    Serial.print(F("\nSYSTEM_MODE_:_AUTOMATIC"));
+    Serial.print(curSec + 1);
+    SERMONn(curSec);
+  }
+}
+
+void stateTick() {
+  unsigned long now = millis();
+  switch (st) {
+    case ST_PRE:
+      if (now - stSince >= T_SERVO_BEFORE_MS) {
+        servoMove(SERVO_POS[curSec]);
+        tuneSector(curSec);
+        Serial.print(F("\nSERVO_MOVING_TO_SECTOR_"));
+        Serial.print(curSec + 1);
+        st = ST_MOVE;
+        stSince = now;
+      }
+      break;
+    case ST_MOVE:
+      if (now - stSince >= T_SERVO_AFTER_MS) enterWater();
+      break;
+    case ST_WATER: {
+      if (!pumpIsOn) { endWatering(F("PUMP_OFF")); break; }
+      unsigned long dur = curManual ? T_MANUAL_MS : (unsigned long)cfg.autoSec * 1000UL;
+      if (now - stSince >= dur) {
+        if (curManual) {
+          pumpOff();
+          Serial.println(F("\nMANUAL_WATERING_TIME_UP - 60 seconds ended"));
+          SERMON_pumpState();
+        }
+        endWatering(F("TIMER"));
+        if (tankLow()) {
+          Serial.print(F("\nWARNING: TANK_LOW, left "));
+          Serial.print(tankLeft() > 0 ? tankLeft() : 0.0f, 2);
+          Serial.print(F("L (estimate)"));
+          tuneTank();
+        } else {
+          tuneDone();
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+}
+
+void safetyTick() {
+  if (pumpIsOn && (millis() - pumpOnSince > T_PUMP_HARD_MAX_MS)) {
+    Serial.print(F("\n!!! PUMP_HARD_MAX_TIME !!!"));
+    if (st != ST_IDLE) endWatering(F("HARD_MAX")); else pumpOff();
+  }
+  if (pumpIsOn && st != ST_WATER) pumpOff();    // помпа не должна работать вне состояния WATER
+}
+
+void alarmTick() {
+  unsigned long now = millis();
+
+  // --- критический перелив приёмника ---
+  bool recvPrint = false;
+  if (recvNew) { recvNew = false; recvPrint = true; }
+  else if (recvOv && (now - lastRecvMsg >= T_STANDBY_MS)) recvPrint = true;
+  if (recvPrint) {
+    lastRecvMsg = now;
+    pumpOff();
+    Serial.print(F("\n!!! RECEIVER_OVERFLOW - FULL STOP !!!"));
+    SERMON_pumpState();
+    SERMON_RAW();
+    tuneRecv();
+    if (st != ST_IDLE) endWatering(F("RECEIVER_OVERFLOW"));
+  }
+
+  // --- переливы поддонов ---
+  bool trayPrint = false;
+  for (byte i = 0; i < SECTORS; i++) {
+    if (trayNew[i]) {
+      trayNew[i] = false;
+      trayPrint = true;
+      if (st != ST_IDLE && curSec == i) { pumpOff(); }
+    }
+  }
+  bool trayAny = false;
+  for (byte i = 0; i < SECTORS; i++) if (trayOv[i]) trayAny = true;
+  if (!trayPrint && trayAny && (now - lastTrayMsg >= T_STANDBY_MS)) trayPrint = true;
+  if (trayPrint && trayAny) {
+    lastTrayMsg = now;
+    for (byte i = 0; i < SECTORS; i++) {
+      if (trayOv[i]) {
+        Serial.print(F("\n!!! TRAY_"));
+        Serial.print(i + 1);
+        Serial.print(F("_OVERFLOW !!!"));
+      }
+    }
+    tuneTray();
+    if (st != ST_IDLE && trayOv[curSec]) endWatering(F("TRAY_OVERFLOW"));
+  }
+}
+
+void autoEvaluate() {
+  if (st != ST_IDLE || serviceActive || recvOv) return;
+  unsigned long now = millis();
+  for (byte i = 0; i < SECTORS; i++) {
+    if (cfg.trig[i] == 0) continue;                        // автополив сектора выключен
+    if (!sensorOk[i]) continue;                            // датчик в состоянии CHK
+    if (trayOv[i]) continue;                               // поддон полон
+    if (pct[i] >= cfg.trig[i]) continue;                   // влажности достаточно
+    if (everWatered[i] && (now - lastEnd[i] < T_SOAK_MS)) continue;   // сектор "отдыхает"
+    if (tankEmpty()) {
+      if (now - lastTankMsg >= T_STANDBY_MS || lastTankMsg == 0) {
+        lastTankMsg = now;
+        Serial.print(F("\nWARNING: TANK_EMPTY (estimate) - auto watering blocked, use refill"));
+        tuneTank();
+      }
+      return;
+    }
+    beginWatering(i, false);
+    return;
+  }
+}
+
+void onMeasured() {
+  lastMeasure = millis();
+  vccRead();
+  calibrate();
+  if (st == ST_WATER) {
+    SERMON_pumpState();
+  } else if (st == ST_IDLE) {
+    autoEvaluate();
+    if (reportAfterMeasure && st == ST_IDLE) {
+      Serial.print(serviceActive ? F("\nSYSTEM_MODE_:_SERVICE") : F("\nSYSTEM_MODE_:_AUTOMATIC STBY"));
+      SERMON_STANDBY();
+      lastStby = millis();
+    }
+  }
+  reportAfterMeasure = false;
+}
+
+void measureSchedule() {
+  if (measActive) return;
+  if (st != ST_IDLE && st != ST_WATER) return;
+  unsigned long iv = (st == ST_WATER) ? T_UPDATE_MS : T_MEASURE_IDLE_MS;
+  if (millis() - lastMeasure >= iv) measureStart();
+}
+
+void standbyTick() {
+  if (st != ST_IDLE) return;
+  unsigned long now = millis();
+  if (now - lastStby >= T_STANDBY_MS) {
+    lastStby = now;
+    Serial.print(serviceActive ? F("\nSYSTEM_MODE_:_SERVICE") : F("\nSYSTEM_MODE_:_AUTOMATIC STBY"));
+    SERMON_STANDBY();
+  }
+}
+
+// ============================================================================
+//  СЕРВИСНЫЙ РЕЖИМ
+// ============================================================================
+void serviceEnter() {
+  endWatering(F("SERVICE"));
+  serviceActive = true;
+  serviceSince = millis();
+  Serial.println(F("\nPAUSED_FOR_SERVICE_ON:"));
+  Serial.print(T_SERVICE_MS / 1000UL / 60UL);
+  Serial.print(F(" min (s or a = exit)"));
+}
+
+void serviceExit() {
+  serviceActive = false;
+  Serial.print(F("\nSERVICE_END"));
+}
+
+void serviceTick() {
+  if (serviceActive && (millis() - serviceSince >= T_SERVICE_MS)) serviceExit();
+}
+
+// ============================================================================
+//  КОМАНДЫ
+// ============================================================================
+void printHelp() {
+  Serial.println(F("\n1-5 = start, off1-off5 or 0 = stop, a = auto"));
+  Serial.println(F("s = service pause on/off (30 min), \nstatus = one JSON line, \nvol = water volume"));
+  Serial.println(F("t1=35 = auto threshold % of sector 1 (0 = off), \nta=10 = auto watering seconds"));
+  Serial.println(F("cal1dry / cal1wet = store current reading of sensor 1 (in air / in water)"));
+  Serial.println(F("flow=1.5 = pump L/min, \ntank=10 = tank liters, \nrefill = tank filled"));
+  Serial.println(F("sound=0|1 = melodies off/on, \nfactory = reset EEPROM to defaults"));
+}
+
+void printVolume() {
+  float total = 0.0f;
+  for (byte i = 0; i < SECTORS; i++) total += cnt.vol[i];
+  for (byte i = 0; i < SECTORS; i++) {
+    Serial.print(i == 0 ? F("\nVOL_") : F("\tVOL_"));
+    Serial.print(i + 1);
+    Serial.print(F(":"));
+    Serial.print(cnt.vol[i], 2);
+    Serial.print(F("L"));
+  }
+  Serial.print(F("\nVOL_TOTAL:"));
+  Serial.print(total, 2);
+  Serial.print(F("L\tFLOW:"));
+  Serial.print(cfg.flowLpm, 2);
+  Serial.print(F("L/min"));
+  if (cfg.tankL > 0.0f) {
+    Serial.print(F("\tTANK_LEFT:"));
+    Serial.print(tankLeft(), 2);
+    Serial.print(F("L/"));
+    Serial.print(cfg.tankL, 1);
+    Serial.print(F("L"));
+  }
+  if (cfg.flowLpm <= 0.0f) Serial.print(F("\nFLOW_NOT_SET (use flow=1.5)"));
+}
+
+void printStatus() {
+  Serial.print(F("\n@{\"fw\":5009,\"state\":\""));
+  if (serviceActive && st == ST_IDLE) Serial.print(F("SERVICE"));
+  else if (st == ST_IDLE) Serial.print(F("IDLE"));
+  else if (st == ST_PRE) Serial.print(F("PRE"));
+  else if (st == ST_MOVE) Serial.print(F("MOVE"));
+  else Serial.print(F("WATER"));
+  Serial.print(F("\",\"pump\":"));
+  Serial.print(pumpIsOn ? 1 : 0);
+  Serial.print(F(",\"sector\":"));
+  Serial.print(st == ST_IDLE ? 0 : curSec + 1);
+  Serial.print(F(",\"manual\":"));
+  Serial.print((st != ST_IDLE && curManual) ? 1 : 0);
+  Serial.print(F(",\"recv\":"));
+  Serial.print(recvOv ? 1 : 0);
+  Serial.print(F(",\"soil\":["));
+  for (byte i = 0; i < SECTORS; i++) { if (i) Serial.print(F(",")); Serial.print(sensorOk[i] ? pct[i] : -1); }
+  Serial.print(F("],\"raw\":["));
+  for (byte i = 0; i < SECTORS; i++) { if (i) Serial.print(F(",")); Serial.print(mstLvl[i]); }
+  Serial.print(F("],\"tray\":["));
+  for (byte i = 0; i < SECTORS; i++) { if (i) Serial.print(F(",")); Serial.print(trayOv[i] ? 1 : 0); }
+  Serial.print(F("],\"trig\":["));
+  for (byte i = 0; i < SECTORS; i++) { if (i) Serial.print(F(",")); Serial.print(cfg.trig[i]); }
+  Serial.print(F("],\"calmin\":["));
+  for (byte i = 0; i < SECTORS; i++) { if (i) Serial.print(F(",")); Serial.print(cfg.calMin[i]); }
+  Serial.print(F("],\"calmax\":["));
+  for (byte i = 0; i < SECTORS; i++) { if (i) Serial.print(F(",")); Serial.print(cfg.calMax[i]); }
+  Serial.print(F("],\"temp\":"));
+  if (airOk) Serial.print(lastAirTemp, 1); else Serial.print(F("null"));
+  Serial.print(F(",\"hum\":"));
+  if (airOk) Serial.print(lastAirHum, 1); else Serial.print(F("null"));
+  Serial.print(F(",\"servo\":"));
+  Serial.print(servoPosNow);
+  Serial.print(F(",\"up\":"));
+  Serial.print(millis() / 1000UL);
+  Serial.print(F(",\"auto_s\":"));
+  Serial.print(cfg.autoSec);
+  Serial.print(F(",\"sound\":"));
+  Serial.print(cfg.sound);
+  Serial.print(F(",\"flow\":"));
+  Serial.print(cfg.flowLpm, 2);
+  Serial.print(F(",\"tank\":"));
+  Serial.print(cfg.tankL, 1);
+  Serial.print(F(",\"left\":"));
+  if (cfg.tankL > 0.0f) Serial.print(tankLeft(), 2); else Serial.print(F("null"));
+  Serial.print(F(",\"vol\":["));
+  float total = 0.0f;
+  for (byte i = 0; i < SECTORS; i++) { if (i) Serial.print(F(",")); Serial.print(cnt.vol[i], 2); total += cnt.vol[i]; }
+  Serial.print(F("],\"total\":"));
+  Serial.print(total, 2);
+  Serial.println(F("}"));
+}
+
+void cmdManualStart(byte s) {
+  if (serviceActive) { Serial.println(F("\nSERVICE_MODE_ACTIVE - send s to exit")); return; }
+  if (recvOv) { Serial.println(F("\nMANUAL_BLOCKED: RECEIVER_OVERFLOW")); return; }
+  if (trayOv[s]) {
+    Serial.print(F("\nMANUAL_BLOCKED: TRAY_"));
+    Serial.print(s + 1);
+    Serial.println(F("_OVERFLOW"));
+    return;
+  }
+  if (tankEmpty()) Serial.println(F("\nWARNING: TANK_EMPTY (estimate)"));
+  beginWatering(s, true);
+}
+
+void cmdStop() {
+  endWatering(F("MANUAL_STOP"));
+  pumpOff();
+  Serial.println(F("\nPUMP STOPPED"));
+  tuneStop();
+  SERMON_pumpState();
+}
+
+void cmdAuto() {
+  if (serviceActive) serviceExit();
+  endWatering(F("AUTO_CMD"));
+  reportAfterMeasure = true;
+  measureStart();
+}
+
+void cmdService() {
+  if (serviceActive) serviceExit(); else serviceEnter();
+}
+
+void printTarget(byte i) {
+  Serial.print(F("\nTarget_"));
+  Serial.print(i + 1);
+  Serial.print(F(":"));
+  Serial.print(cfg.trig[i]);
+  Serial.print(F("%"));
+}
+
+void cmdCalibrate(byte i, bool dry) {
+  if (st != ST_IDLE || pumpIsOn) { Serial.println(F("\nCAL_BLOCKED: watering in progress")); return; }
+  measureBlocking();
+  if (dry) cfg.calMax[i] = mstLvl[i]; else cfg.calMin[i] = mstLvl[i];
+  settingsSave();
+  Serial.print(F("\nCAL_"));
+  Serial.print(i + 1);
+  Serial.print(dry ? F("_DRY=") : F("_WET="));
+  Serial.print(mstLvl[i]);
+  Serial.print(F("\trange "));
+  Serial.print(cfg.calMin[i]);
+  Serial.print(F("-"));
+  Serial.print(cfg.calMax[i]);
+  if (cfg.calMax[i] - cfg.calMin[i] < 30) Serial.print(F("\tCAL_RANGE_INVALID: need dry (air) > wet (water) by 30+"));
+}
+
+bool parseNumber(const char *s, float &out) {
+  if (*s == 0) return false;
+  char *end;
+  out = (float)strtod(s, &end);
+  return (*end == 0);
+}
+
+void processCommand() {
+  cmdBuf[cmdLen] = 0;
+  bool bad = cmdOver;
+  cmdLen = 0;
+  cmdOver = false;
+  if (bad) { Serial.println(F("\nUNKNOWN_COMMAND (too long), send help")); return; }
+  for (byte k = 0; cmdBuf[k]; k++) if (cmdBuf[k] == ',') cmdBuf[k] = '.';
+  const char *q = cmdBuf;
+  byte len = strlen(q);
+  float v;
+
+  if (!strcmp(q, "help")) { printHelp(); return; }
+  if (len == 1 && q[0] >= '1' && q[0] <= '5') { cmdManualStart(q[0] - '1'); return; }
+  if (!strcmp(q, "0") || (len == 4 && !strncmp(q, "off", 3) && q[3] >= '1' && q[3] <= '5')) { cmdStop(); return; }
+  if (!strcmp(q, "a")) { cmdAuto(); return; }
+  if (!strcmp(q, "s")) { cmdService(); return; }
+  if (!strcmp(q, "status")) { printStatus(); return; }
+  if (!strcmp(q, "vol")) { printVolume(); return; }
+
+  if (!strcmp(q, "refill")) {
+    cnt.sinceRefill = 0.0f;
+    countersSave();
+    Serial.print(F("\nTANK_REFILLED, left "));
+    Serial.print(cfg.tankL, 1);
+    Serial.print(F("L"));
+    return;
+  }
+  if (!strcmp(q, "factory")) {
+    settingsDefaults();
+    settingsSave();
+    countersDefaults();
+    cnt.servoPos = servoPosNow;
+    countersSave();
+    calibrate();
+    Serial.print(F("\nFACTORY_DEFAULTS_RESTORED"));
+    return;
+  }
+  // t1=35
+  if (len >= 4 && q[0] == 't' && q[1] >= '1' && q[1] <= '5' && q[2] == '=') {
+    if (parseNumber(q + 3, v) && v >= 0.0f && v <= 100.0f) {
+      byte i = q[1] - '1';
+      cfg.trig[i] = (byte)(v + 0.5f);
+      settingsSave();
+      printTarget(i);
+    } else Serial.println(F("\nBAD_VALUE: threshold 0..100"));
+    return;
+  }
+  // cal1dry / cal1wet
+  if (len == 7 && !strncmp(q, "cal", 3) && q[3] >= '1' && q[3] <= '5') {
+    if (!strcmp(q + 4, "dry")) { cmdCalibrate(q[3] - '1', true); return; }
+    if (!strcmp(q + 4, "wet")) { cmdCalibrate(q[3] - '1', false); return; }
+  }
+  if (!strncmp(q, "flow=", 5)) {
+    if (parseNumber(q + 5, v) && v >= 0.0f && v <= 500.0f) {
+      cfg.flowLpm = v;
+      settingsSave();
+      Serial.print(F("\nFLOW:"));
+      Serial.print(cfg.flowLpm, 2);
+      Serial.print(F("L/min"));
+    } else Serial.println(F("\nBAD_VALUE: flow 0..500 L/min"));
+    return;
+  }
+  if (!strncmp(q, "tank=", 5)) {
+    if (parseNumber(q + 5, v) && v >= 0.0f && v <= 10000.0f) {
+      cfg.tankL = v;
+      settingsSave();
+      Serial.print(F("\nTANK:"));
+      Serial.print(cfg.tankL, 1);
+      Serial.print(F("L"));
+    } else Serial.println(F("\nBAD_VALUE: tank 0..10000 L"));
+    return;
+  }
+  if (!strncmp(q, "ta=", 3)) {
+    if (parseNumber(q + 3, v) && v >= 1.0f && v <= (float)AUTO_SEC_MAX) {
+      cfg.autoSec = (uint16_t)(v + 0.5f);
+      settingsSave();
+      Serial.print(F("\nAUTO_WATERING_SECONDS:"));
+      Serial.print(cfg.autoSec);
+    } else Serial.println(F("\nBAD_VALUE: ta 1..100 s"));
+    return;
+  }
+  if (!strncmp(q, "sound=", 6)) {
+    if (!strcmp(q + 6, "0") || !strcmp(q + 6, "1")) {
+      cfg.sound = (q[6] == '1') ? 1 : 0;
+      settingsSave();
+      Serial.print(F("\nSOUND:"));
+      Serial.print(cfg.sound);
+    } else Serial.println(F("\nBAD_VALUE: sound=0|1"));
+    return;
+  }
+  Serial.println(F("\nUNKNOWN_COMMAND, send help"));
+}
+
+void serialTick() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    lastRx = millis();
+    if (c == '\n' || c == '\r') {
+      if (cmdLen || cmdOver) processCommand();
+      continue;
+    }
+    if (isControl(c)) continue;
+    if (cmdLen < sizeof(cmdBuf) - 1) cmdBuf[cmdLen++] = tolower(c);
+    else cmdOver = true;
+  }
+  // режим "No line ending": команда считается законченной после паузы
+  if ((cmdLen || cmdOver) && (millis() - lastRx > 60)) processCommand();
+}
+
+// ============================================================================
+//  SETUP / LOOP
+// ============================================================================
+void setup() {
+  // === САМОЕ ПЕРВОЕ — помпа выключена (сначала уровень, потом режим: без выброса) ===
+  digitalWrite(PIN_PUMP, PUMP_OFF);
+  pinMode(PIN_PUMP, OUTPUT);
+
+  Serial.begin(9600);
+
+  for (byte i = 0; i < SECTORS; i++) pinMode(PIN_TRAY[i], INPUT_PULLUP);
+  pinMode(PIN_RECEIVER_OVF, INPUT_PULLUP);       // замкнут на GND = перелив
+
+  bool cfgOk = settingsLoad();
+  if (!cfgOk) settingsDefaults();
+  bool cntOk = countersLoad();
+  if (!cntOk) countersDefaults();
+  servoPosNow = cnt.servoPos;
+
+  tuneStart();
+  unsigned long t0 = millis();
+  while (millis() - t0 < 1200) buzzer.loop();
+
+  Serial.println();
+  Serial.print(F("\n¯|_(ツ)_/¯---SYSTEM STARTED---¯|_(ツ)_/¯..."));
+  Serial.print(F("\nSWS 5009 state machine.h..."));
+  Serial.println();
+  Serial.println(F("\nFor_MANUAL_WATERING_use_commands: \n1/off1 - Sector 1 Watering..."));
+  Serial.print(F("\nEEPROM_SETTINGS:"));
+  Serial.print(cfgOk ? F("OK") : F("DEFAULTS"));
+  Serial.print(F("\tEEPROM_COUNTERS:"));
+  Serial.print(cntOk ? F("OK") : F("EMPTY"));
+
+  Serial.print(F("\nReading HTU21D..."));
+  myHumidity.begin();
+  htuRead();
+
+  SERMON_HUM_TEMP();
+  SERMON_SERVO();
+  SERMON_RUNTIME();
+
+  Serial.print(F("\nReading SOIL SENSORS..."));
+  sampleInputs();
+  measureBlocking();
+  selfTest();
+  SERMON_RAW();
+  Serial.print(F("\n"));
+}
+
+void loop() {
+  buzzer.loop();
+  sampleInputs();
+  alarmTick();
+  safetyTick();
+  serialTick();
+  serviceTick();
+  stateTick();
+  if (measureTick()) onMeasured();
+  measureSchedule();
+  standbyTick();
+}
